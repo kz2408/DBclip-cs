@@ -1,0 +1,1 @@
+bash tools/dist_train.sh configs/voc/LT_resnet50_pfc_DB.py
