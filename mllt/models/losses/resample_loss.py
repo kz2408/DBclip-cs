@@ -40,7 +40,10 @@ class ResampleLoss(nn.Module):
                  ),
                  reweight_func=None,  # None, 'inv', 'sqrt_inv', 'rebalance', 'CB'
                  weight_norm=None, # None, 'by_instance', 'by_batch'
-                 freq_file='./class_freq.pkl'):
+                 freq_file='./class_freq.pkl',
+                 label_smoothing=0.0,
+                 logit_temp=1.0,
+                 ema_decay=0.0):
         super(ResampleLoss, self).__init__()
 
         assert (use_sigmoid is True) or (partial is False)
@@ -93,6 +96,20 @@ class ResampleLoss(nn.Module):
         self.freq_inv = torch.ones(self.class_freq.shape).cuda() / self.class_freq
         self.propotion_inv = self.train_num / self.class_freq
 
+        # label smoothing param
+        self.label_smoothing = label_smoothing
+
+        # logit temperature scaling param
+        self.logit_temp = logit_temp
+
+        # EMA class frequency update (ema_decay > 0 to enable)
+        self.ema_decay = ema_decay
+        if self.ema_decay > 0:
+            self.register_buffer('ema_class_freq', self.class_freq.clone().detach())
+
+        # numerical stability epsilon
+        self.eps = 1e-7
+
         # print('\033[1;35m loading from {} | {} | {} | s\033[0;0m'.format(freq_file, reweight_func, logit_reg))
         # print('\033[1;35m rebalance reweighting mapping params: {:.2f} | {:.2f} | {:.2f} \033[0;0m'.format(self.map_alpha, self.map_beta, self.map_gamma))
 
@@ -108,6 +125,22 @@ class ResampleLoss(nn.Module):
         reduction = (
             reduction_override if reduction_override else self.reduction)
 
+        # EMA class frequency update
+        if self.ema_decay > 0:
+            batch_size = label.shape[0]
+            batch_freq = label.float().sum(0).detach() / batch_size
+            self.ema_class_freq = (
+                self.ema_decay * self.ema_class_freq
+                + (1 - self.ema_decay) * batch_freq
+            )
+
+        # label smoothing
+        if self.label_smoothing > 0:
+            smooth_label = label.float() * (1 - self.label_smoothing) \
+                           + 0.5 * self.label_smoothing
+        else:
+            smooth_label = label.float()
+
         weight = self.reweight_functions(label)
 
         cls_score, weight = self.logit_reg_functions(label.float(), cls_score, weight)
@@ -119,15 +152,24 @@ class ResampleLoss(nn.Module):
             # pt is sigmoid(logit) for pos or sigmoid(-logit) for neg
             pt = torch.exp(logpt)
             loss = self.cls_criterion(
-                cls_score, label.float(), weight=weight, reduction='none')
+                cls_score, smooth_label, weight=weight, reduction='none')
             loss = ((1 - pt) ** self.gamma) * loss
             loss = self.balance_param * loss
         else:
-            loss = self.cls_criterion(cls_score, label.float(), weight,
+            loss = self.cls_criterion(cls_score, smooth_label, weight,
                                       reduction=reduction)
 
         loss = self.loss_weight * loss
         return loss
+
+    def update_focal_gamma(self, new_gamma):
+        """Dynamically update the focal loss gamma parameter.
+
+        Args:
+            new_gamma (float): New gamma value for focal loss. Higher values
+                focus more on hard examples. Typical range is [0, 5].
+        """
+        self.gamma = new_gamma
 
     def reweight_functions(self, label):
         if self.reweight_func is None:
@@ -144,9 +186,9 @@ class ResampleLoss(nn.Module):
         if self.weight_norm is not None:
             if 'by_instance' in self.weight_norm:
                 max_by_instance, _ = torch.max(weight, dim=-1, keepdim=True)
-                weight = weight / max_by_instance
+                weight = weight / (max_by_instance + self.eps)
             elif 'by_batch' in self.weight_norm:
-                weight = weight / torch.max(weight)
+                weight = weight / (torch.max(weight) + self.eps)
 
         return weight
 
@@ -157,7 +199,11 @@ class ResampleLoss(nn.Module):
             logits += self.init_bias
         if 'neg_scale' in self.logit_reg:
             logits = logits * (1 - labels) * self.neg_scale  + logits * labels
-            weight = weight / self.neg_scale * (1 - labels) + weight * labels
+            if weight is not None:
+                weight = weight / self.neg_scale * (1 - labels) + weight * labels
+        # temperature scaling
+        if self.logit_temp != 1.0:
+            logits = logits / self.logit_temp
         return logits, weight
 
     def rebalance_weight(self, gt_labels):
